@@ -58,36 +58,36 @@ def compute_factors(ohlcv_df: pd.DataFrame, include_pin: bool = True) -> pd.Data
 
     # Iterate through each ticker in the DataFrame
     for ticker in ohlcv_df.columns.get_level_values(0).unique():
-        # Select data for the current ticker
-        ticker_data = ohlcv_df[ticker]
-        # ticker_data now has Date index and columns: Open, High, Low, Close, Volume
+        # Select data for the current ticker, dropping the ticker level from columns
+        # This gives a DataFrame with columns like 'Open', 'High', 'Low', 'Close', 'Volume'
+        ticker_data_flat = ohlcv_df.xs(ticker, level='Ticker', axis=1)
 
-        ticker_factors_df = pd.DataFrame(index=ticker_data.index) # DataFrame for this ticker's factors
+        ticker_factors_df = pd.DataFrame(index=ticker_data_flat.index) # DataFrame for this ticker's factors
         
         # --- Momentum (1M, 3M, 12M returns, excluding most recent month) ---
         for period_days in [21, 63, 252]:
-            past_price = ticker_data['Close'].shift(period_days)
-            current_price_minus_1 = ticker_data['Close'].shift(1)
+            past_price = ticker_data_flat['Close'].shift(period_days)
+            current_price_minus_1 = ticker_data_flat['Close'].shift(1)
             momentum = (current_price_minus_1 / past_price) - 1
             ticker_factors_df[f'Momentum_{period_days}D'] = momentum
 
         # --- Mean-reversion ---
         # 5-day RSI
-        ticker_factors_df['RSI_5D'] = _calculate_rsi(ticker_data['Close'], window=5)
+        ticker_factors_df['RSI_5D'] = _calculate_rsi(ticker_data_flat['Close'], window=5)
 
         # 20-day z-score of closing price
-        rolling_mean_20d = ticker_data['Close'].rolling(window=20).mean()
-        rolling_std_20d = ticker_data['Close'].rolling(window=20).std()
-        ticker_factors_df['Price_Zscore_20D'] = (ticker_data['Close'] - rolling_mean_20d) / rolling_std_20d
+        rolling_mean_20d = ticker_data_flat['Close'].rolling(window=20).mean()
+        rolling_std_20d = ticker_data_flat['Close'].rolling(window=20).std()
+        ticker_factors_df['Price_Zscore_20D'] = (ticker_data_flat['Close'] - rolling_mean_20d) / rolling_std_20d
 
         # --- Volatility (20-day rolling standard deviation of daily returns) ---
-        daily_returns = ticker_data['Close'].pct_change()
+        daily_returns = ticker_data_flat['Close'].pct_change()
         ticker_factors_df['Volatility_20D'] = daily_returns.rolling(window=20).std()
 
         # --- Volume (20-day z-score of volume) ---
-        rolling_mean_vol_20d = ticker_data['Volume'].rolling(window=20).mean()
-        rolling_std_vol_20d = ticker_data['Volume'].rolling(window=20).std()
-        ticker_factors_df['Volume_Zscore_20D'] = (ticker_data['Volume'] - rolling_mean_vol_20d) / rolling_std_vol_20d
+        rolling_mean_vol_20d = ticker_data_flat['Volume'].rolling(window=20).mean()
+        rolling_std_vol_20d = ticker_data_flat['Volume'].rolling(window=20).std()
+        ticker_factors_df['Volume_Zscore_20D'] = (ticker_data_flat['Volume'] - rolling_mean_vol_20d) / rolling_std_vol_20d
         
         # Add a 'Ticker' column before appending to flatten and then re-MultiIndex later
         all_factors_by_ticker.append(ticker_factors_df.assign(Ticker=ticker))
