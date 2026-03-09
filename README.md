@@ -1,6 +1,23 @@
-# PINtrade
+# PINtrade: An Alpha Factor Research & Backtesting Engine
 
-PINtrade is an alpha factor research and backtesting engine. It allows you to define, compute, and backtest various quantitative trading factors, including market microstructure-inspired factors like the Probability of Informed Trading (PIN).
+PINtrade is a robust Python framework designed for quantitative finance enthusiasts and researchers to develop, test, and analyze various alpha trading factors. It provides a structured pipeline for data loading, factor computation (including advanced market microstructure metrics like the Probability of Informed Trading - PIN), signal generation, and vectorized backtesting. With PINtrade, you can quickly evaluate the performance of your trading strategies against historical market data.
+
+## Key Features
+
+-   **Flexible Data Loading**: Seamlessly pull OHLCV data for multiple tickers from Yahoo Finance.
+-   **Comprehensive Factor Library**: Compute a suite of well-known alpha factors, including:
+    -   Momentum (21D, 63D, 252D)
+    -   Relative Strength Index (RSI_5D)
+    -   Price Z-score (20D)
+    -   Volatility (20D)
+    -   Volume Z-score (20D)
+    -   **Probability of Informed Trading (PIN)**: Calculated using the Easley-Kiefer-O'Hara-Paperman (EKOP) model.
+    -   **Daily Event Labels**: Classify trading days as 'Good News' (+1), 'Bad News' (-1), or 'No Event' (0) based on the EKOP model.
+-   **Modular Alpha Model Design**: Easily integrate custom alpha models with an abstract base class.
+-   **Vectorized Backtesting Engine**: Efficiently simulate trading strategies with configurable rebalancing periods (monthly/weekly) and top-N stock selection.
+-   **Performance Metrics**: Automatically calculate Sharpe Ratio, Maximum Drawdown, and Annualized Return.
+-   **Visualization**: Generate equity curve plots to visually assess strategy performance.
+-   **GitHub Actions CI/CD**: Basic setup for continuous integration to ensure code quality and test coverage.
 
 ## Project Structure
 
@@ -30,13 +47,13 @@ pintrade/
 main.py                    # Main script to run the entire pipeline
 pytest.ini                 # Pytest configuration
 requirements.txt           # Python dependencies
-setup_github.py            # Script to set up GitHub repository and push initial commit
+setup_github.py            # Script to set up Git for pushing to GitHub
 README.md                  # Project README
 ```
 
 ## Setup and Installation
 
-1.  **Clone the repository (or initialize it if you're setting up for the first time):**
+1.  **Clone the repository:**
     ```bash
     git clone https://github.com/YOUR_GITHUB_USERNAME/pintrade.git
     cd pintrade
@@ -56,30 +73,37 @@ README.md                  # Project README
     pip install -r requirements.txt
     ```
 
-4.  **Configure GitHub (Optional, for initial repository creation and push):**
+4.  **Configure Git for GitHub (Optional, for pushing changes):**
     Create a `.env` file in the root directory of the project with your GitHub Token and Username:
     ```
     GITHUB_TOKEN="YOUR_GITHUB_TOKEN"
     GITHUB_USERNAME="YOUR_GITHUB_USERNAME"
     ```
-    **Note:** Your GitHub Token needs `repo` scope to create repositories. Then run:
+    **Note:** Your GitHub Token needs `repo` scope to push to the repository. Then, run the setup script:
     ```bash
     python setup_github.py
     ```
+    This script will initialize your local Git repository, add your files, commit them, configure the remote, and push your changes to GitHub.
 
-## How to Run
+## How to Run the Backtest Pipeline
 
-To run the full PINtrade pipeline (data loading, signal generation, backtesting):
+To execute the full PINtrade pipeline, which includes data loading, signal generation, and backtesting, simply run:
 
 ```bash
 python main.py
 ```
 
-This will output the backtest results (Sharpe Ratio, Max Drawdown, Annualized Return) and save an equity curve plot as `backtest_equity_curve.png` in the project root.
+This will:
+-   Download historical OHLCV data for predefined tickers.
+-   Compute various alpha factors, including PIN and daily event labels.
+-   Generate composite alpha signals.
+-   Run a vectorized backtest with the specified `top_n` stocks and `rebalance` frequency.
+-   Output key backtest performance metrics (Sharpe Ratio, Max Drawdown, Annualized Return) to the console.
+-   Save an equity curve plot as `backtest_equity_curve.png` in the project root directory.
 
 ## Testing
 
-To run unit tests (if any are implemented):
+To run unit tests (if any are implemented in the future):
 
 ```bash
 pytest
