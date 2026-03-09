@@ -16,7 +16,7 @@ def test_loader():
 def test_factors():
  from pintrade.data.loader import load_ohlcv_data
  from pintrade.features.factors import compute_factors
- df = load_ohlcv_data(['AAPL', 'MSFT'], '2023-01-01', '2023-06-01')
+ df = load_ohlcv_data(['AAPL', 'MSFT'], '2021-01-01', '2023-06-01')
  factors = compute_factors(df, include_pin=False)
  assert isinstance(factors, pd.DataFrame)
  assert len(factors) > 0
@@ -25,8 +25,9 @@ def test_factors():
 def test_signals():
  from pintrade.data.loader import load_ohlcv_data
  from pintrade.models.factor_model import FactorAlphaModel
- df = load_ohlcv_data(['AAPL', 'MSFT'], '2023-01-01', '2023-06-01')
+ df = load_ohlcv_data(['AAPL', 'MSFT'], '2021-01-01', '2023-06-01')
  model = FactorAlphaModel()
+ model.fit(df)
  signals = model.generate_signals(df)
  assert isinstance(signals, pd.Series)
  assert len(signals) > 0
