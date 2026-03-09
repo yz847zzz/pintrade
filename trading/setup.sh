@@ -1,0 +1,1 @@
+pip install yfinance vectorbt pandas numpy matplotlib plotly backtrader

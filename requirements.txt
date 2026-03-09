@@ -1,0 +1,9 @@
+yfinance
+pandas
+numpy
+scipy
+matplotlib
+requests
+python-dotenv
+pytest
+flake8
