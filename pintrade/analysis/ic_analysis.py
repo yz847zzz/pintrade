@@ -110,8 +110,8 @@ if __name__ == '__main__':
     print("Loading OHLCV data...")
     df = load_ohlcv_data(tickers, '2019-01-01', '2023-12-31')
 
-    print("Computing factors (include_pin=False)...")
-    factor_df = compute_factors(df, include_pin=False)
+    print("Computing factors (include_pin=True)...")
+    factor_df = compute_factors(df, include_pin=True)
 
     print("Computing IC...")
     ic_df = compute_ic(factor_df, df, forward_days=21)
