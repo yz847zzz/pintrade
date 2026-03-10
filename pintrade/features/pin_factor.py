@@ -1,22 +1,22 @@
 """
-pintrade/features/ekop_model.py
+pintrade/features/pin_factor.py
 
-Standard EKOP Model (Easley-Kiefer-O'Hara-Paperman 1996)
-Pure Poisson arrivals — no Inverse Gaussian mixing (VDJ)
+VDJ (Volume-Decomposed) PIN Model
+Translated from MATLAB — exact implementation
 
-Parameters: (alpha, delta, mu, epsi)
-  alpha : probability of information event
-  delta : probability of bad news | event
-  mu    : informed trader arrival rate
-  epsi  : uninformed trader arrival rate (buy = sell)
+Model parameters: (alpha, delta, epsi, mu, invpsi)
+  alpha  : probability of information event
+  delta  : probability of bad news | event
+  epsi   : uninformed trader arrival rate
+  mu     : informed trader arrival rate
+  invpsi : 1/psi (inverse of Inverse Gaussian shape param)
 
-Scenarios:
-  No event  : B ~ Pois(epsi),    S ~ Pois(epsi)
-  Good news : B ~ Pois(epsi+mu), S ~ Pois(epsi)
-  Bad news  : B ~ Pois(epsi),    S ~ Pois(epsi+mu)
+Three scenarios per day:
+  No event  : l1 = epsi,      l2 = epsi
+  Good news : l1 = epsi+mu,   l2 = epsi
+  Bad news  : l1 = epsi,      l2 = epsi+mu
 
-PIN (model) = alpha*mu / (alpha*mu + 2*epsi)
-PIN (empirical) = (Good days + Bad days) / Total days
+PIN = (Good days + Bad days) / Total days  [empirical frequency]
 """
 
 import numpy as np
@@ -25,141 +25,247 @@ from scipy.optimize import minimize
 import pandas as pd
 
 
-# ── 1. Poisson log PMF ────────────────────────────────────────────────────────
+# ── 1. DP Log Bessel K (translated exactly from MATLAB BuildLogBesselArray) ──
 
-def log_poisson(k: np.ndarray, lam: float) -> np.ndarray:
+def build_log_besselk_array(max_trade: int, z: float) -> np.ndarray:
     """
-    Log PMF of Poisson(lam) evaluated at k.
-    log g(k; lam) = k*log(lam) - lam - log(k!)
+    Exact translation of MATLAB BuildLogBesselArray.
+
+    K*(1) = 1                          → log = 0
+    K*(2) = 1 + z                      → log = log(1 + z)
+    K*(t) recurrence (t >= 3):
+        fac = z^2 / ((2t-3)(2t-5))
+        log K*(t) = log K*(t-2) + log_sum_exp(log K*(t-1) - log K*(t-2), log(fac))
+
+    Returns array of length max_trade where arr[t-1] = log K*(t).
+    """
+    Nk  = max_trade
+    arr = np.zeros(Nk)
+
+    if Nk < 1:
+        return arr
+
+    arr[0] = 0.0                          # K*(1) = 1
+
+    if Nk >= 2:
+        arr[1] = np.log(1.0 + z + 1e-300) # K*(2) = 1 + z
+
+    for t in range(3, Nk + 1):
+        fac     = z**2 / ((2.0*t - 3.0) * (2.0*t - 5.0) + 1e-300)
+        log_fac = np.log(abs(fac) + 1e-300)
+        d       = arr[t-2] - arr[t-3]     # log K*(t-1) - log K*(t-2)
+        m       = max(d, log_fac)
+        log_sum = m + np.log(np.exp(d - m) + np.exp(log_fac - m))
+        arr[t-1] = arr[t-3] + log_sum     # log K*(t) = log K*(t-2) + log_sum
+
+    return arr
+
+
+def log_besselk_safe(trades: np.ndarray, z: float) -> np.ndarray:
+    """
+    Lookup log K*(trades[i]) from DP array.
+    trades are integers (Bt+St for each day).
+    """
+    trades  = np.round(trades).astype(int)
+    max_idx = int(trades.max())
+    arr     = build_log_besselk_array(max_idx, float(z))
+    return arr[trades - 1]  # arr[t-1] = log K*(t)
+
+
+# ── 2. Core VDJ log-likelihood (exact translation of MATLAB log_fPIG2) ────────
+
+def log_fPIG(Bt: np.ndarray, St: np.ndarray,
+             l1: float, l2: float, psi: float) -> np.ndarray:
+    """
+    Exact Python translation of MATLAB log_fPIG_withTable.
+    Equation (16) from VDJ paper.
     """
     epsilon = 1e-300
-    return k * np.log(lam + epsilon) - lam - gammaln(k + 1)
+    Bt = np.asarray(Bt, dtype=float)
+    St = np.asarray(St, dtype=float)
+
+    # Poisson fallback: psi > 100 (EKOP limit), or counts too large for the
+    # Bessel recurrence (numerically unstable for max_trade >> 1 000).
+    # Must include -l1 -l2 to match the Bessel path's log_term4 limit.
+    if psi > 100 or int((Bt + St).max()) > 1_000:
+        return (Bt * np.log(l1 + epsilon) - l1 - gammaln(Bt + 1) +
+                St * np.log(l2 + epsilon) - l2 - gammaln(St + 1))
+
+    psi2      = psi ** 2
+    sum_l     = l1 + l2
+    sqrt_term = np.sqrt(psi2 + 2.0 * sum_l)
+    z         = psi * sqrt_term          # scalar
+
+    log_fact_Bt = gammaln(Bt + 1)
+    log_fact_St = gammaln(St + 1)
+    trades      = (Bt + St).astype(int)
+
+    # Build Bessel lookup table once for this z
+    max_trade        = int(trades.max()) + 1
+    log_bessel_arr   = build_log_besselk_array(max_trade, float(z))
+
+    # Compute Bessel term per day
+    log_bessel_term = np.zeros(len(Bt))
+    mask = trades > 0
+    if mask.any():
+        t_nz  = trades[mask]                         # integer trades
+        log_K = log_bessel_arr[t_nz - 1]            # log K*(t)
+        # scale term: 0.5*log(pi) + (t-1)*log(z/2) - gammaln(t-0.5)
+        log_scale = (0.5 * np.log(np.pi)
+                     + (t_nz - 1.0) * np.log(z / 2.0 + epsilon)
+                     - gammaln(t_nz - 0.5))
+        log_bessel_term[mask] = log_K - log_scale
+
+    log_term1 = Bt * np.log(l1 + epsilon) - log_fact_Bt
+    log_term2 = St * np.log(l2 + epsilon) - log_fact_St
+    log_term3 = ((Bt + St) / 2.0) * np.log(
+                    psi2 / (psi2 + 2.0 * sum_l + epsilon) + epsilon)
+    log_term4 = psi2 - psi * sqrt_term
+
+    result = log_term1 + log_term2 + log_term3 + log_term4 + log_bessel_term
+    result[np.isinf(result)] = -1e10
+    return result
 
 
-# ── 2. EKOP NLL (equation 3-4 from paper) ────────────────────────────────────
+# ── 3. NLL function (exact translation of MATLAB nll_function_vdj_new) ────────
 
-def ekop_nll(params: np.ndarray, buys: np.ndarray, sells: np.ndarray) -> float:
+def nll_function(params_scaled: np.ndarray,
+                 buys: np.ndarray, sells: np.ndarray,
+                 scale: np.ndarray) -> float:
     """
-    EKOP negative log-likelihood.
-    params = [alpha, delta, mu, epsi]
-
-    L_t = (1-alpha) * g(b;epsi)*g(s;epsi)
-        + alpha*(1-delta) * g(b;epsi+mu)*g(s;epsi)
-        + alpha*delta     * g(b;epsi)*g(s;epsi+mu)
+    Negative log-likelihood in scaled parameter space.
+    Equation (17): L_VDJ = prod_t [(1-a)*h_none + a*(1-d)*h_good + a*d*h_bad]
     """
-    alpha, delta, mu, epsi = params
-    alpha = np.clip(alpha, 1e-6, 1-1e-6)
-    delta = np.clip(delta, 1e-6, 1-1e-6)
-    mu    = max(mu,   1e-6)
-    epsi  = max(epsi, 1e-6)
+    params = params_scaled * scale
+    alpha  = np.clip(params[0], 1e-6, 1-1e-6)
+    delta  = np.clip(params[1], 1e-6, 1-1e-6)
+    epsi   = max(params[2], 1e-10)
+    mu     = max(params[3], 1e-10)
+    invpsi = max(params[4], 1e-4)
+    psi    = 1.0 / invpsi
 
-    # Per-day log-likelihoods for each scenario
-    log_none = log_poisson(buys, epsi)    + log_poisson(sells, epsi)
-    log_good = log_poisson(buys, epsi+mu) + log_poisson(sells, epsi)
-    log_bad  = log_poisson(buys, epsi)    + log_poisson(sells, epsi+mu)
+    log_f_none = log_fPIG(buys, sells, epsi,      epsi,      psi)
+    log_f_good = log_fPIG(buys, sells, epsi + mu, epsi,      psi)
+    log_f_bad  = log_fPIG(buys, sells, epsi,      epsi + mu, psi)
 
-    # Log weights
-    lw_none = np.log(1.0 - alpha)
-    lw_good = np.log(alpha) + np.log(1.0 - delta)
-    lw_bad  = np.log(alpha) + np.log(delta)
+    safe_log  = lambda x: np.log(max(float(x), 1e-12))
+    lw_none   = safe_log(1.0 - alpha)
+    lw_good   = safe_log(alpha) + safe_log(1.0 - delta)
+    lw_bad    = safe_log(alpha) + safe_log(delta)
 
-    # Log-sum-exp per day
-    log_comp = np.column_stack([
-        lw_none + log_none,
-        lw_good + log_good,
-        lw_bad  + log_bad,
+    log_components = np.column_stack([
+        lw_none + log_f_none,
+        lw_good + log_f_good,
+        lw_bad  + log_f_bad,
     ])
-    m      = log_comp.max(axis=1, keepdims=True)
-    loglik = m.squeeze() + np.log(np.exp(log_comp - m).sum(axis=1))
+
+    m      = log_components.max(axis=1, keepdims=True)
+    loglik = m.squeeze() + np.log(np.exp(log_components - m).sum(axis=1))
     loglik[np.isinf(loglik)] = -1e10
 
     return -np.sum(loglik)
 
 
-# ── 3. MLE fitting ────────────────────────────────────────────────────────────
+# ── 4. MLE parameter fitting ──────────────────────────────────────────────────
 
-def fit_ekop(buys: np.ndarray, sells: np.ndarray) -> dict:
+def fit_vdj_mle(buys: np.ndarray, sells: np.ndarray) -> dict:
     """
-    Fit EKOP via MLE with multiple initial guesses.
-
-    Initial guesses spread across plausible parameter space.
-    epsi ≈ mean daily volume (uninformed dominates)
-    mu   ≈ small fraction of mean volume
+    Fit VDJ parameters via MLE.
+    Normalizes Bt/St by total mean volume — keeps z manageable.
+    epsi/mu in normalized space. PIN is scale-invariant.
     """
     buys  = np.asarray(buys,  dtype=float)
     sells = np.asarray(sells, dtype=float)
 
-    mean_v = (buys.mean() + sells.mean()) / 2.0
+    # mean of total daily volume (buys + sells)
+    mean_volume = (buys + sells).mean()
+    if mean_volume < 1e-10:
+        return dict(alpha=np.nan, delta=np.nan, epsi=np.nan,
+                    mu=np.nan, invpsi=np.nan, psi=np.nan, converged=False)
 
-    # [alpha, delta, mu, epsi]
-    # epsi should be close to mean volume, mu is a fraction of it
-    initial_guesses = [
-        [0.3, 0.5, mean_v * 0.10, mean_v * 0.90],
-        [0.5, 0.5, mean_v * 0.20, mean_v * 0.80],
-        [0.2, 0.3, mean_v * 0.05, mean_v * 0.95],
-        [0.7, 0.5, mean_v * 0.30, mean_v * 0.70],
-        [0.4, 0.6, mean_v * 0.15, mean_v * 0.85],
-    ]
-    bounds = [
-        (1e-6, 1-1e-6),   # alpha
-        (1e-6, 1-1e-6),   # delta
-        (1e-6, None),      # mu
-        (1e-6, None),      # epsi
-    ]
+    # epsi and mu are arrival rates — upper bound = 3 × mean daily volume
+    maxInvPsi = 100.0
+    scale = np.array([1.0, 1.0, 3.0 * mean_volume, 3.0 * mean_volume, maxInvPsi])
+
+    # Initial guesses in scaled [0,1] space.
+    # epsi ≈ 0.45 * mean_volume → scaled = 0.45/3 ≈ 0.15
+    # mu   ≈ small fraction of mean_volume (like ekop_model.py)
+    initial_param_sets = np.array([
+        [0.3, 0.5, 0.150, 0.033, 0.005],
+        [0.5, 0.5, 0.133, 0.067, 0.010],
+        [0.2, 0.3, 0.117, 0.050, 0.020],
+        [0.7, 0.5, 0.100, 0.100, 0.005],
+        [0.4, 0.6, 0.150, 0.017, 0.010],
+    ])
+
+    bounds = [(1e-6, 1.0-1e-6),   # alpha
+              (1e-6, 1.0-1e-6),   # delta
+              (1e-6, 1.0),         # epsi scaled  (actual = x * 3*mean_volume)
+              (1e-6, 1.0),         # mu   scaled
+              (1e-6, 1.0)]         # invpsi scaled
 
     best_nll    = np.inf
     best_params = None
 
-    for x0 in initial_guesses:
+    for x0_scaled in initial_param_sets:
         try:
             res = minimize(
-                ekop_nll, x0, args=(buys, sells),
-                method='SLSQP', bounds=bounds,
-                options={'maxiter': 5000, 'ftol': 1e-10}
+                nll_function,
+                x0_scaled,
+                args=(buys, sells, scale),   # raw volumes, no normalization
+                method='SLSQP',
+                bounds=bounds,
+                options={'maxiter': 5000, 'ftol': 1e-9}
             )
             if res.fun < best_nll:
                 best_nll    = res.fun
-                best_params = res.x
+                best_params = res.x * scale
         except Exception:
             continue
 
     if best_params is None:
-        return dict(alpha=np.nan, delta=np.nan, mu=np.nan, epsi=np.nan,
-                    PIN_model=np.nan, PIN_empirical=np.nan, converged=False)
+        return dict(alpha=np.nan, delta=np.nan, epsi=np.nan,
+                    mu=np.nan, invpsi=np.nan, psi=np.nan, converged=False)
 
-    alpha, delta, mu, epsi = best_params
-    pin_model = alpha * mu / (alpha * mu + 2.0 * epsi)
+    alpha, delta, epsi, mu, invpsi = best_params
+    invpsi = max(invpsi, 1e-4)
+    psi    = 1.0 / invpsi
 
     return dict(alpha=float(alpha), delta=float(delta),
-                mu=float(mu), epsi=float(epsi),
-                PIN_model=float(pin_model),
-                NLL=float(best_nll), converged=True)
+                epsi=float(epsi),   mu=float(mu),
+                invpsi=float(invpsi), psi=float(psi),
+                converged=True)
 
 
-# ── 4. Daily Bayesian classification ─────────────────────────────────────────
+# ── 5. Daily Bayesian event classification ────────────────────────────────────
 
-def classify_days_ekop(buys: np.ndarray, sells: np.ndarray,
-                       params: dict) -> np.ndarray:
+def classify_days(buys: np.ndarray, sells: np.ndarray,
+                  params: dict) -> np.ndarray:
     """
-    Classify each day via posterior argmax.
+    Posterior Bayesian classification of each day.
+    Matches MATLAB: scores = exp(logf) * prior, label = argmax.
     Returns: +1 (Good), -1 (Bad), 0 (No Event)
     """
     alpha = params['alpha']
     delta = params['delta']
-    mu    = params['mu']
     epsi  = params['epsi']
+    mu    = params['mu']
+    psi   = params['psi']
 
-    log_comp = np.column_stack([
-        np.log(alpha*(1-delta)) + log_poisson(buys, epsi+mu) + log_poisson(sells, epsi),      # Good
-        np.log(alpha*delta)     + log_poisson(buys, epsi)    + log_poisson(sells, epsi+mu),    # Bad
-        np.log(1.0 - alpha)     + log_poisson(buys, epsi)    + log_poisson(sells, epsi),       # None
+    logf = np.column_stack([
+        log_fPIG(buys, sells, epsi + mu, epsi,      psi),  # Good (+1)
+        log_fPIG(buys, sells, epsi,      epsi + mu, psi),  # Bad  (-1)
+        log_fPIG(buys, sells, epsi,      epsi,      psi),  # None ( 0)
     ])
 
-    x_hat = np.argmax(log_comp, axis=1)
+    prior  = np.array([alpha*(1-delta), alpha*delta, 1.0-alpha])
+    scores = np.exp(logf) * prior
+    x_hat  = np.argmax(scores, axis=1)
+
     return np.array([+1, -1, 0])[x_hat]
 
 
-# ── 5. Lee-Ready estimator ────────────────────────────────────────────────────
+# ── 6. Lee-Ready buy/sell volume estimator ────────────────────────────────────
 
 def estimate_buy_sell_volume(df: pd.DataFrame) -> pd.DataFrame:
     """
@@ -177,35 +283,35 @@ def estimate_buy_sell_volume(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-# ── 6. Wide → Long ────────────────────────────────────────────────────────────
+# ── 7. Wide → Long format converter ──────────────────────────────────────────
 
 def _wide_to_long(df: pd.DataFrame) -> pd.DataFrame:
     if not isinstance(df.columns, pd.MultiIndex):
         return df
-    level = 0 if df.columns.names[0] == 'Ticker' else 1
-    df_long = df.stack(level=level, future_stack=True)
+    if df.columns.names[0] == 'Ticker':
+        df_long = df.stack(level=0, future_stack=True)
+    else:
+        df_long = df.stack(level=1, future_stack=True)
     df_long.index.names = ['Date', 'Ticker']
     return df_long
 
 
-# ── 7. Main factor computation ────────────────────────────────────────────────
+# ── 8. Main factor computation ────────────────────────────────────────────────
 
-def compute_ekop_factor(
+def compute_vdj_factor(
     df: pd.DataFrame,
-    period: str = 'annual'   # 'annual', 'monthly', or 'both'
+    period: str = 'annual'
 ) -> pd.DataFrame:
     """
     For each ticker and each calendar window:
       1. Estimate buy/sell volume via Lee-Ready
-      2. Fit EKOP MLE ONCE per window
+      2. Fit VDJ MLE ONCE per window
       3. Classify every day: Good (+1) / Bad (-1) / No Event (0)
-      4. PIN_empirical = (Good + Bad) / Total
-      5. PIN_model     = alpha*mu / (alpha*mu + 2*epsi)
+      4. PIN = (Good + Bad days) / Total days
 
-    Returns DataFrame (Date, Ticker):
-      PIN_empirical : float ∈ (0,1) — frequency of informed days
-      PIN_model     : float ∈ (0,1) — model-implied PIN
-      event_label   : int ∈ {+1,-1,0} — daily classification
+    Returns DataFrame (Date, Ticker) with:
+      PIN_annual       : float ∈ (0,1)
+      VDJ_label_annual : int ∈ {+1,-1,0}
     """
     df_long = _wide_to_long(df)
     df_vol  = estimate_buy_sell_volume(df_long)
@@ -227,18 +333,22 @@ def compute_ekop_factor(
                 if len(buys) < 5:
                     continue
 
-                params = fit_ekop(buys, sells)
+                params = fit_vdj_mle(buys, sells)
                 if not params['converged']:
                     continue
 
-                labels      = classify_days_ekop(buys, sells, params)
-                n_event     = int(np.sum(labels != 0))
-                pin_emp     = n_event / len(labels)
+                labels    = classify_days(buys, sells, params)
+
+                # PIN = alpha*mu / (alpha*mu + 2*epsi) — model-implied
+                pin_value = float(np.clip(
+                    params['alpha'] * params['mu'] /
+                    (params['alpha'] * params['mu'] + 2 * params['epsi'] + 1e-300),
+                    0.0, 1.0))
 
                 print(f"  {ticker} {key}: "
                       f"alpha={params['alpha']:.3f} delta={params['delta']:.3f} "
                       f"mu={params['mu']:.0f} epsi={params['epsi']:.0f} "
-                      f"PIN_model={params['PIN_model']:.3f} PIN_emp={pin_emp:.3f} "
+                      f"PIN={pin_value:.3f} "
                       f"Good={int((labels==1).sum())} "
                       f"Bad={int((labels==-1).sum())} "
                       f"None={int((labels==0).sum())}")
@@ -247,8 +357,8 @@ def compute_ekop_factor(
                     results.append({
                         'Date':        date,
                         'Ticker':      ticker,
-                        'PIN':         params['PIN_model'],   # alpha*mu / (alpha*mu + 2*epsi)
-                        'event_label': int(labels[i]),        # +1 Good / -1 Bad / 0 None
+                        'PIN':         pin_value,      # alpha*mu / (alpha*mu + 2*epsi)
+                        'event_label': int(labels[i]), # +1 Good / -1 Bad / 0 None
                     })
 
     if not results:
@@ -259,7 +369,7 @@ def compute_ekop_factor(
               .sort_index())
 
 
-# ── 8. Test block ──────────────────────────────────────────────────────────────
+# ── 9. Test block ──────────────────────────────────────────────────────────────
 
 if __name__ == '__main__':
     from pintrade.data.loader import load_ohlcv_data
@@ -267,16 +377,16 @@ if __name__ == '__main__':
     print("Loading OHLCV data...")
     df = load_ohlcv_data(['AAPL', 'MSFT', 'GOOG'], '2022-01-01', '2023-12-31')
 
-    print("\nFitting EKOP model (annual)...")
-    ekop_df = compute_ekop_factor(df, period='annual')
+    print("\nFitting VDJ model (annual)...")
+    vdj_df = compute_vdj_factor(df, period='annual')
 
-    print("\n--- EKOP Factor Head ---")
-    print(ekop_df.head(12))
+    print("\n--- VDJ Factor Head ---")
+    print(vdj_df.head(12))
 
     print("\n--- Describe ---")
-    print(ekop_df.describe())
+    print(vdj_df.describe())
 
-    print("\n--- Event Label Distribution ---")
-    print(ekop_df['event_label'].value_counts())
+    print("\n--- Label Distribution ---")
+    print(vdj_df['event_label'].value_counts())
 
-    print(f"\nPIN range: {ekop_df['PIN'].min():.4f} ~ {ekop_df['PIN'].max():.4f}")
+    print(f"\nPIN range: {vdj_df['PIN'].min():.4f} ~ {vdj_df['PIN'].max():.4f}")
