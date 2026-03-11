@@ -1,186 +1,313 @@
 import pandas as pd
 import numpy as np
+import yfinance as yf
+
+# ── Module-level fundamental cache (survives within a Python session) ──────────
+_fundamental_cache: dict = {}
+
+# ── IC-informed default composite weights ─────────────────────────────────────
+DEFAULT_WEIGHTS = {
+    'Momentum_21D':      1,   # ICIR +0.077
+    'Momentum_63D':      1,   # ICIR +0.140
+    'Momentum_252D':     1,   # ICIR +0.182
+    'RSI_5D':            1,   # ICIR +0.095
+    'Price_Zscore_20D':  1,   # ICIR +0.072
+    'Volatility_20D':    1,   # ICIR +0.103
+    'Volume_Zscore_20D': 0,   # ICIR -0.057 (t=-1.79, excluded)
+    'Amihud_20D':       -1,   # ICIR -0.087 (liquid growth stocks dominated 2019-2023)
+    'PE_Ratio':          0,   # ICIR +0.082 (t=1.45, not significant after bias fix)
+    'PB_Ratio':          1,   # ICIR +0.165 (t=2.28, marginal growth premium)
+    'ROE':              -1,   # ICIR -0.308 (t=-4.25, significant — growth era)
+    'ROA':              -1,   # ICIR -0.179 (t=-2.48, significant — growth era)
+    'PIN':              -1,   # ICIR -0.297 (confirmed negative)
+    'event_label':       0,   # ICIR ~0.000 (no signal)
+}
+
+# Technical factors that must be non-NaN for a row to be kept
+_TECHNICAL_COLS = [
+    'Momentum_21D', 'Momentum_63D', 'Momentum_252D',
+    'RSI_5D', 'Price_Zscore_20D', 'Volatility_20D',
+    'Volume_Zscore_20D', 'Amihud_20D',
+]
+
+
+# ── Fundamental data helpers ──────────────────────────────────────────────────
+
+def _fetch_fundamentals(ticker: str) -> dict:
+    """
+    Fetch annual income statement + balance sheet for one ticker via yfinance.
+    Returns dict of pd.Series with fiscal-year-end dates as index:
+      EPS  (annual Basic EPS from income statement — no .info snapshot)
+      BVPS (book value per share = equity / shares, from balance sheet)
+      ROE  (net income / equity)
+      ROA  (net income / total assets)
+
+    Shares are taken from the annual balance sheet ('Ordinary Shares Number')
+    rather than .info (which is a current-date snapshot and causes lookahead).
+    The 60-day reporting lag is applied in _to_daily(), so a fiscal year ending
+    on date F is not usable until F + 60 days.
+    Cached per ticker to avoid repeated API calls.
+    """
+    if ticker in _fundamental_cache:
+        return _fundamental_cache[ticker]
+
+    result = {}
+    try:
+        t   = yf.Ticker(ticker)
+        fin = t.financials       # annual income statement; cols = fiscal-year-end dates
+        bs  = t.balance_sheet    # annual balance sheet;    cols = fiscal-year-end dates
+
+        def _get_row(df, labels):
+            """Return first matching row as a sorted date-indexed Series, or None."""
+            if df is None or df.empty:
+                return None
+            for lbl in labels:
+                if lbl in df.index:
+                    s = df.loc[lbl].dropna()
+                    if len(s) > 0:
+                        return s.sort_index()
+            return None
+
+        net_income = _get_row(fin, ['Net Income', 'NetIncome'])
+        equity     = _get_row(bs,  ['Stockholders Equity', 'Total Stockholder Equity',
+                                     'Common Stock Equity',
+                                     'Total Equity Gross Minority Interest'])
+        assets     = _get_row(bs,  ['Total Assets'])
+        shares     = _get_row(bs,  ['Ordinary Shares Number', 'Share Issued'])
+        eps_direct = _get_row(fin, ['Basic EPS', 'Diluted EPS'])
+
+        # EPS: prefer income-statement figure (no share-count ambiguity)
+        if eps_direct is not None and len(eps_direct) > 0:
+            result['EPS'] = eps_direct
+        elif net_income is not None and shares is not None:
+            common = net_income.index.intersection(shares.index)
+            if len(common) > 0:
+                result['EPS'] = (net_income.loc[common] /
+                                 shares.loc[common].replace(0, np.nan))
+
+        # BVPS = equity / shares
+        if equity is not None and shares is not None:
+            common = equity.index.intersection(shares.index)
+            if len(common) > 0:
+                result['BVPS'] = (equity.loc[common] /
+                                  shares.loc[common].replace(0, np.nan))
+
+        # ROE = net income / equity
+        if net_income is not None and equity is not None:
+            common = net_income.index.intersection(equity.index)
+            if len(common) > 0:
+                result['ROE'] = (net_income.loc[common] /
+                                 equity.loc[common].replace(0, np.nan))
+
+        # ROA = net income / total assets
+        if net_income is not None and assets is not None:
+            common = net_income.index.intersection(assets.index)
+            if len(common) > 0:
+                result['ROA'] = (net_income.loc[common] /
+                                 assets.loc[common].replace(0, np.nan))
+
+    except Exception:
+        pass
+
+    _fundamental_cache[ticker] = result
+    return result
+
+
+def _to_daily(quarterly_series: pd.Series,
+              daily_index: pd.DatetimeIndex,
+              lag_days: int = 60) -> pd.Series:
+    """
+    Forward-fill a quarterly series (index = fiscal quarter-end dates)
+    onto a daily DatetimeIndex, with a point-in-time reporting lag.
+
+    A report for quarter ending on date Q is assumed available on Q + lag_days
+    (default 60 days ≈ 2 months after quarter close, per SEC filing deadlines).
+    On date t, carries the value from the most recent report available at t.
+    """
+    s = quarterly_series.copy()
+    s.index = pd.DatetimeIndex(s.index) + pd.Timedelta(days=lag_days)
+    s = s.sort_index()
+    combined = s.reindex(s.index.union(daily_index)).sort_index().ffill()
+    return combined.reindex(daily_index)
+
+
+# ── Factor computation ────────────────────────────────────────────────────────
 
 def _calculate_rsi(series, window):
-    """Calculates the Relative Strength Index (RSI)."""
     delta = series.diff()
-    gain = (delta.where(delta > 0, 0)).rolling(window=window).mean()
-    loss = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    gain  = (delta.where(delta > 0, 0)).rolling(window=window).mean()
+    loss  = (-delta.where(delta < 0, 0)).rolling(window=window).mean()
+    rs    = gain / loss
+    return 100 - (100 / (1 + rs))
 
-    rs = gain / loss
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
 
 def _cross_sectional_zscore_normalize(factor_df):
     """
-    Normalizes factors using cross-sectional z-scoring (daily).
-    Handles cases where std() is zero or all values are NaN for a given cross-section.
+    Cross-sectional z-score per day.  NaN values in any column are preserved.
     """
     normalized_frames = []
     for date in factor_df.index.get_level_values('Date').unique():
-        daily_factors = factor_df.loc[date] # Get cross-section for the current date (index is Ticker, columns are factors)
-        
-        # Apply z-score column-wise (across tickers for each factor)
-        normalized_daily_factors = pd.DataFrame(index=daily_factors.index, columns=daily_factors.columns)
-        for col in daily_factors.columns:
-            series = daily_factors[col]
-            if series.isnull().all():
-                normalized_daily_factors[col] = np.nan
+        daily = factor_df.loc[date]
+        normed = pd.DataFrame(index=daily.index, columns=daily.columns)
+        for col in daily.columns:
+            s = daily[col]
+            if s.isnull().all():
+                normed[col] = np.nan
             else:
-                std_val = series.std()
-                if std_val == 0:
-                    normalized_daily_factors[col] = 0.0
-                else:
-                    normalized_daily_factors[col] = (series - series.mean()) / std_val
-        
-        # Reconstruct MultiIndex for the normalized daily frame
-        multi_idx = pd.MultiIndex.from_product([[date], daily_factors.index], names=['Date', 'Ticker'])
-        normalized_daily_factors.index = multi_idx
-        normalized_frames.append(normalized_daily_factors)
+                std = s.std()
+                normed[col] = 0.0 if std == 0 else (s - s.mean()) / std
+
+        mi = pd.MultiIndex.from_product([[date], daily.index],
+                                        names=['Date', 'Ticker'])
+        normed.index = mi
+        normalized_frames.append(normed)
 
     if not normalized_frames:
-        return pd.DataFrame(index=pd.MultiIndex.from_arrays([[],[]], names=['Date', 'Ticker']))
+        return pd.DataFrame(
+            index=pd.MultiIndex.from_arrays([[], []], names=['Date', 'Ticker']))
 
-    normalized_df = pd.concat(normalized_frames)
-    # After normalization, fill any remaining NaNs (e.g., from initial NaNs or all-NaN groups) with 0
-    # Only fillna(0) AFTER cross-sectional normalization, if necessary. For now, let's rely on dropna at the compute_factors level.
-    # normalized_df = normalized_df.fillna(0) 
-    return normalized_df
+    return pd.concat(normalized_frames)
 
-def compute_factors(ohlcv_df: pd.DataFrame, include_pin: bool = True) -> pd.DataFrame:
+
+def compute_factors(ohlcv_df: pd.DataFrame,
+                    include_pin: bool = True) -> pd.DataFrame:
     """
-    Computes cross-sectional alpha factors from OHLCV data.
-    Returns a DataFrame with factors, indexed by (Date, Ticker).
-    
-    Assumes ohlcv_df has a MultiIndex (Ticker, OHLCV_Type) for columns and a Date index for rows.
+    Compute cross-sectional alpha factors from OHLCV data.
+
+    Technical factors (require full history, rows with NaN dropped):
+      Momentum_21D/63D/252D, RSI_5D, Price_Zscore_20D,
+      Volatility_20D, Volume_Zscore_20D, Amihud_20D
+
+    Fundamental factors (annual, forward-filled; NaN kept for older dates):
+      PE_Ratio, PB_Ratio, ROE, ROA
+
+    All factors are cross-sectionally z-scored daily.
+
+    Parameters
+    ----------
+    ohlcv_df   : wide OHLCV DataFrame, (Ticker, Price) MultiIndex columns
+    include_pin: if True, append EKOP PIN + event_label factors
+
+    Returns
+    -------
+    DataFrame indexed by (Date, Ticker)
     """
-    all_factors_by_ticker = []
+    all_factors = []
+    tickers = ohlcv_df.columns.get_level_values(0).unique()
 
-    # Iterate through each ticker in the DataFrame
-    for ticker in ohlcv_df.columns.get_level_values(0).unique():
-        # Select data for the current ticker, dropping the ticker level from columns
-        # This gives a DataFrame with columns like 'Open', 'High', 'Low', 'Close', 'Volume'
-        ticker_data_flat = ohlcv_df.xs(ticker, level='Ticker', axis=1)
+    print(f"  Fetching fundamentals for {len(tickers)} tickers...")
+    for ticker in tickers:
+        _fetch_fundamentals(ticker)   # pre-warm cache
 
-        ticker_factors_df = pd.DataFrame(index=ticker_data_flat.index) # DataFrame for this ticker's factors
-        
-        # --- Momentum (1M, 3M, 12M returns, excluding most recent month) ---
-        for period_days in [21, 63, 252]:
-            past_price = ticker_data_flat['Close'].shift(period_days)
-            current_price_minus_1 = ticker_data_flat['Close'].shift(1)
-            momentum = (current_price_minus_1 / past_price) - 1
-            ticker_factors_df[f'Momentum_{period_days}D'] = momentum
+    for ticker in tickers:
+        df   = ohlcv_df.xs(ticker, level='Ticker', axis=1)
+        rows = pd.DataFrame(index=df.index)
 
-        # --- Mean-reversion ---
-        # 5-day RSI
-        ticker_factors_df['RSI_5D'] = _calculate_rsi(ticker_data_flat['Close'], window=5)
+        # ── Momentum ──────────────────────────────────────────────────────────
+        prev = df['Close'].shift(1)
+        for days in [21, 63, 252]:
+            rows[f'Momentum_{days}D'] = prev / df['Close'].shift(days) - 1
 
-        # 20-day z-score of closing price
-        rolling_mean_20d = ticker_data_flat['Close'].rolling(window=20).mean()
-        rolling_std_20d = ticker_data_flat['Close'].rolling(window=20).std()
-        ticker_factors_df['Price_Zscore_20D'] = (ticker_data_flat['Close'] - rolling_mean_20d) / rolling_std_20d
+        # ── Mean-reversion ────────────────────────────────────────────────────
+        rows['RSI_5D']           = _calculate_rsi(df['Close'], 5)
+        roll20                   = df['Close'].rolling(20)
+        rows['Price_Zscore_20D'] = (df['Close'] - roll20.mean()) / roll20.std()
 
-        # --- Volatility (20-day rolling standard deviation of daily returns) ---
-        daily_returns = ticker_data_flat['Close'].pct_change()
-        ticker_factors_df['Volatility_20D'] = daily_returns.rolling(window=20).std()
+        # ── Volatility ────────────────────────────────────────────────────────
+        ret = df['Close'].pct_change()
+        rows['Volatility_20D']   = ret.rolling(20).std()
 
-        # --- Volume (20-day z-score of volume) ---
-        rolling_mean_vol_20d = ticker_data_flat['Volume'].rolling(window=20).mean()
-        rolling_std_vol_20d = ticker_data_flat['Volume'].rolling(window=20).std()
-        ticker_factors_df['Volume_Zscore_20D'] = (ticker_data_flat['Volume'] - rolling_mean_vol_20d) / rolling_std_vol_20d
-        
-        # Add a 'Ticker' column before appending to flatten and then re-MultiIndex later
-        all_factors_by_ticker.append(ticker_factors_df.assign(Ticker=ticker))
-    
-    if not all_factors_by_ticker:
-        return pd.DataFrame(index=pd.MultiIndex.from_arrays([[],[]], names=['Date', 'Ticker']))
+        # ── Volume z-score ────────────────────────────────────────────────────
+        rvol = df['Volume'].rolling(20)
+        rows['Volume_Zscore_20D'] = (df['Volume'] - rvol.mean()) / rvol.std()
 
-    # Concatenate all ticker-specific factor DataFrames
-    combined_factors = pd.concat(all_factors_by_ticker)
-    
-    # Set MultiIndex (Date, Ticker)
-    combined_factors = combined_factors.set_index([combined_factors.index, 'Ticker']).sort_index()
-    combined_factors.index.names = ['Date', 'Ticker']
+        # ── Amihud illiquidity ────────────────────────────────────────────────
+        dollar_vol             = df['Close'] * df['Volume']
+        rows['Amihud_20D']     = (
+            ret.abs() / dollar_vol.replace(0, np.nan)
+        ).rolling(20).mean() * 1e6   # scale to readable range
 
-    # Reinstating dropna after enough debugging
-    combined_factors = combined_factors.dropna()
+        # ── Fundamental factors (forward-filled annual data) ──────────────────
+        fund  = _fundamental_cache.get(ticker, {})
+        dates = df.index
 
-    # Apply cross-sectional z-scoring normalization
-    factor_df = _cross_sectional_zscore_normalize(combined_factors)
-    
+        if 'EPS' in fund and len(fund['EPS']) > 0:
+            eps = _to_daily(fund['EPS'], dates)
+            rows['PE_Ratio'] = df['Close'] / eps.where(eps > 0)
+
+        if 'BVPS' in fund and len(fund['BVPS']) > 0:
+            bvps = _to_daily(fund['BVPS'], dates)
+            rows['PB_Ratio'] = df['Close'] / bvps.where(bvps > 0)
+
+        if 'ROE' in fund and len(fund['ROE']) > 0:
+            rows['ROE'] = _to_daily(fund['ROE'], dates)
+
+        if 'ROA' in fund and len(fund['ROA']) > 0:
+            rows['ROA'] = _to_daily(fund['ROA'], dates)
+
+        all_factors.append(rows.assign(Ticker=ticker))
+
+    if not all_factors:
+        return pd.DataFrame(
+            index=pd.MultiIndex.from_arrays([[], []], names=['Date', 'Ticker']))
+
+    combined = pd.concat(all_factors)
+    combined = combined.set_index([combined.index, 'Ticker']).sort_index()
+    combined.index.names = ['Date', 'Ticker']
+
+    # Drop rows missing any technical factor (fundamentals may remain NaN)
+    combined = combined.dropna(subset=_TECHNICAL_COLS)
+
+    # Cross-sectional z-score normalise all columns
+    factor_df = _cross_sectional_zscore_normalize(combined)
+
     if include_pin:
         from pintrade.features.ekop_model import compute_ekop_factor
-        pin_df = compute_ekop_factor(ohlcv_df, period='annual') # Pass ohlcv_df as it needs original data
-        # pin_df has columns: PIN, event_label
-        # join on (Date, Ticker) MultiIndex
+        pin_df    = compute_ekop_factor(ohlcv_df, period='annual')
         factor_df = factor_df.join(pin_df, how='left')
-    
+
     return factor_df
 
-def get_composite_score(factor_df: pd.DataFrame, weights: dict = None) -> pd.Series:
+
+def get_composite_score(factor_df: pd.DataFrame,
+                        weights: dict = None) -> pd.Series:
     """
-    Combines all factors into a single composite alpha score.
-    Uses equal weights by default, but accepts a custom weights dict.
-    The output Series is indexed by (Date, Ticker).
+    Weighted composite alpha score.
+
+    Default weights are IC-informed (see DEFAULT_WEIGHTS):
+      - Momentum / quality / illiquidity factors: +1
+      - PIN: -1 (ICIR = -0.21)
+      - Volume_Zscore_20D, event_label: 0 (excluded)
+      - Value factors (PE, PB): -1 (low ratio → high return)
+
+    Factors missing from factor_df are silently skipped.
+    NaN values in a factor contribute 0 to that row's score.
+
+    Parameters
+    ----------
+    factor_df : (Date, Ticker) MultiIndex DataFrame of z-scored factors
+    weights   : optional dict overriding DEFAULT_WEIGHTS
+
+    Returns
+    -------
+    Series indexed by (Date, Ticker)
     """
     if factor_df.empty:
-        return pd.Series(dtype=float, index=pd.MultiIndex.from_arrays([[],[]], names=['Date', 'Ticker']))
+        return pd.Series(
+            dtype=float,
+            index=pd.MultiIndex.from_arrays([[], []], names=['Date', 'Ticker']))
 
-    if weights is None:
-        # Equal weighting
-        num_factors = len(factor_df.columns)
-        if num_factors == 0:
-            return pd.Series(0, index=factor_df.index, dtype=float)
-        composite_score = factor_df.mean(axis=1)
-    else:
-        # Custom weighting
-        weighted_factors = pd.DataFrame(index=factor_df.index)
-        for factor, weight in weights.items():
-            if factor in factor_df.columns:
-                weighted_factors[factor] = factor_df[factor] * weight
-            else:
-                print(f"Warning: Factor '{factor}' not found in DataFrame. Skipping.")
-        
-        if weighted_factors.empty:
-             composite_score = pd.Series(0, index=factor_df.index, dtype=float)
-        else:
-            composite_score = weighted_factors.sum(axis=1) # Sum weighted factors
+    w = weights if weights is not None else DEFAULT_WEIGHTS
 
-    return composite_score
+    # Build weighted sum — skip zero-weight and absent factors
+    active = {f: wt for f, wt in w.items() if wt != 0 and f in factor_df.columns}
 
-if __name__ == "__main__":
-    # Example Usage
-    from pintrade.data.loader import load_ohlcv_data
+    if not active:
+        # Fallback: equal weight all present columns
+        return factor_df.mean(axis=1)
 
-    ticker_universe = ["AAPL", "MSFT", "GOOG"]
-    start = "2022-01-01" # Adjusted start date to allow for 252-day momentum calculation
-    end = "2024-01-01"
-
-    ohlcv_data = load_ohlcv_data(ticker_universe, start, end)
-
-    if ohlcv_data is not None and not ohlcv_data.empty:
-        print("\n--- Generating Alpha Factors ---")
-        alpha_factors_df = compute_factors(ohlcv_data)
-        print("\nAlpha Factors Head (Normalized):")
-        print(alpha_factors_df.head())
-        print("\nAlpha Factors Info:")
-        alpha_factors_df.info()
-
-        print("\n--- Generating Composite Score (Equal Weighted) ---")
-        composite_alpha_score = get_composite_score(alpha_factors_df)
-        print("\nComposite Alpha Score Head:")
-        print(composite_alpha_score.head())
-        print("\nComposite Alpha Score Info:")
-        composite_alpha_score.info()
-
-        # Example with custom weights
-        # custom_weights = {
-        #     'Momentum_21D': 0.3,
-        #     'RSI_5D': 0.2,
-        #     'Price_Zscore_20D': 0.2,
-        #     'Volatility_20D': -0.1, # Example: penalize high volatility
-        #     'Volume_Zscore_20D': 0.2
-        # }
-        # custom_composite_score = get_composite_score(alpha_factors_df, weights=custom_weights)
-        # print("\nCustom Weighted Composite Alpha Score Head:")
-        # print(custom_composite_score.head())
+    weighted = pd.DataFrame(
+        {f: factor_df[f].fillna(0) * wt for f, wt in active.items()},
+        index=factor_df.index,
+    )
+    return weighted.sum(axis=1)

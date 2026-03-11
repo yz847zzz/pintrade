@@ -1,6 +1,23 @@
 .env
 __pycache__/
 *.pyc
+*.pyo
+*.egg-info/
 venv/
+.venv/
 *.png
 *.mat
+
+# Large data files (TAQ, LEAN sample data)
+data/
+*.csv
+*.parquet
+*.h5
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+*.ipynb
+
+# IDE
+.vscode/
+.idea/
