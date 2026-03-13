@@ -159,7 +159,7 @@ def test_portfolio_metrics_sharpe_finite():
     m = _portfolio_metrics(rets, mkt)
     assert np.isfinite(m["sharpe_ratio"])
     assert np.isfinite(m["annualized_return"])
-    assert 0.0 <= m["max_drawdown"] <= 1.0
+    assert -1.0 <= m["max_drawdown"] <= 0.0
     assert np.isfinite(m["beta"])
 
 
