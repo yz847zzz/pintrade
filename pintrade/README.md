@@ -93,3 +93,4 @@ Walk-forward protocol: 5 annual folds (2019–2024), 1-year train / 1-year test,
 - [Factors](docs/FACTORS.md) — every factor: formula, IC, weight rationale
 - [Strategy](docs/STRATEGY.md) — composite score, regime logic, walk-forward results
 - [Pipeline](docs/PIPELINE.md) — SEC download, FinBERT scoring, sentiment integration
+- [Roadmap](docs/ROADMAP.md) — planned improvements and future directions
