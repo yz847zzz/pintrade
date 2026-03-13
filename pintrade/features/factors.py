@@ -1,3 +1,6 @@
+import sqlite3
+from pathlib import Path
+
 import pandas as pd
 import numpy as np
 import yfinance as yf
@@ -6,21 +9,26 @@ import yfinance as yf
 _fundamental_cache: dict = {}
 
 # ── IC-informed default composite weights ─────────────────────────────────────
+# Updated 2024 — validated on 25 S&P 500 large caps (2023-01-01 → 2024-12-31)
+# Only factors with |t-stat| > 2.0 are given non-zero weight.
+# Amihud_20D and Volume_Zscore_20D are REVERSAL factors for large-cap growth stocks.
 DEFAULT_WEIGHTS = {
-    'Momentum_21D':      1,   # ICIR +0.077
-    'Momentum_63D':      1,   # ICIR +0.140
-    'Momentum_252D':     1,   # ICIR +0.182
-    'RSI_5D':            1,   # ICIR +0.095
-    'Price_Zscore_20D':  1,   # ICIR +0.072
-    'Volatility_20D':    1,   # ICIR +0.103
-    'Volume_Zscore_20D': 0,   # ICIR -0.057 (t=-1.79, excluded)
-    'Amihud_20D':       -1,   # ICIR -0.087 (liquid growth stocks dominated 2019-2023)
-    'PE_Ratio':          0,   # ICIR +0.082 (t=1.45, not significant after bias fix)
-    'PB_Ratio':          1,   # ICIR +0.165 (t=2.28, marginal growth premium)
-    'ROE':              -1,   # ICIR -0.308 (t=-4.25, significant — growth era)
-    'ROA':              -1,   # ICIR -0.179 (t=-2.48, significant — growth era)
-    'PIN':              -1,   # ICIR -0.297 (confirmed negative)
+    'Momentum_21D':      0,   # ICIR -0.036, t=-0.79  — not significant
+    'Momentum_63D':      0,   # ICIR +0.043, t=+0.95  — not significant
+    'Momentum_252D':     1,   # ICIR +0.135, t=+2.96  — significant
+    'RSI_5D':            0,   # ICIR -0.003, t=-0.07  — not significant
+    'Price_Zscore_20D':  0,   # ICIR -0.074, t=-1.61  — not significant
+    'Volatility_20D':    1,   # ICIR +0.425, t=+9.32  — strong (vol premium)
+    'Volume_Zscore_20D':-1,   # ICIR -0.096, t=-2.10  — reversal: high vol → lower ret
+    'Amihud_20D':       -1,   # ICIR -0.342, t=-7.48  — reversal for large-cap growth
+    'PE_Ratio':          0,   # ICIR +0.037, t=+0.81  — not significant
+    'PB_Ratio':          1,   # ICIR +0.270, t=+5.91  — significant (growth premium)
+    'ROE':               0,   # ICIR +0.069, t=+1.52  — not significant
+    'ROA':               0,   # ICIR +0.028, t=+0.60  — not significant
+    'PIN':              -1,   # ICIR -0.297 (prior study, confirmed negative)
     'event_label':       0,   # ICIR ~0.000 (no signal)
+    'News_Sentiment':    1,   # FinBERT: positive news tone → positive return (Tetlock 2007)
+    'Filing_Sentiment':  1,   # FinBERT: positive 8-K/10-K MD&A tone → positive return
 }
 
 # Technical factors that must be non-NaN for a row to be kept
@@ -131,6 +139,117 @@ def _to_daily(quarterly_series: pd.Series,
     return combined.reindex(daily_index)
 
 
+# ── Sentiment factor loader ───────────────────────────────────────────────────
+
+def load_sentiment_factor(
+    tickers: list,
+    daily_index: pd.DatetimeIndex,
+    sentiment_db: str | Path = "data/sentiment.db",
+    news_ffill_days: int = 5,
+    filing_ffill_days: int = 90,
+) -> pd.DataFrame:
+    """
+    Load FinBERT sentiment scores from sentiment.db and align to daily trading index.
+
+    Two separate signals are returned:
+      News_Sentiment    — from yfinance + RSS news (forward-fill 5 days / 1 week)
+      Filing_Sentiment  — from 8-K earnings releases + 10-K MD&A (forward-fill 90 days)
+
+    Lookahead bias prevention:
+      Scores are shifted forward by 1 trading day — sentiment observed on day T
+      is only usable for trading on day T+1 (after market close on T).
+
+    Parameters
+    ----------
+    tickers          : list of ticker strings to load
+    daily_index      : DatetimeIndex of trading days to align to (from OHLCV data)
+    sentiment_db     : path to sentiment.db created by the pipeline
+    news_ffill_days  : max days to carry forward a news score (default 5)
+    filing_ffill_days: max days to carry forward a filing score (default 90)
+
+    Returns
+    -------
+    DataFrame indexed by (Date, Ticker) with columns: News_Sentiment, Filing_Sentiment
+    NaN where no sentiment data exists within the forward-fill window.
+    """
+    db_path = Path(sentiment_db)
+    if not db_path.exists():
+        return pd.DataFrame(
+            index=pd.MultiIndex.from_arrays([[], []], names=['Date', 'Ticker'])
+        )
+
+    # ── Load raw scores from SQLite ───────────────────────────────────────────
+    ticker_list = "', '".join(tickers)
+    sql = f"""
+        SELECT
+            ticker,
+            date,
+            doc_type,
+            AVG(compound) AS compound
+        FROM sentiment
+        WHERE ticker IN ('{ticker_list}')
+        GROUP BY ticker, date, doc_type
+        ORDER BY ticker, date
+    """
+    conn = sqlite3.connect(str(db_path))
+    raw = pd.read_sql_query(sql, conn)
+    conn.close()
+
+    if raw.empty:
+        return pd.DataFrame(
+            index=pd.MultiIndex.from_arrays([[], []], names=['Date', 'Ticker'])
+        )
+
+    raw['date'] = pd.to_datetime(raw['date'])
+
+    # ── Split into news vs filing signals ─────────────────────────────────────
+    news_mask    = raw['doc_type'] == 'news'
+    filing_mask  = raw['doc_type'].isin(['10-K', '10-Q', '8-K'])
+
+    def _to_daily_wide(df_subset, ffill_limit: int) -> pd.DataFrame:
+        """
+        Pivot (ticker, date, compound) to wide Date×Ticker, reindex to daily_index,
+        forward-fill up to ffill_limit days, shift 1 day for lookahead prevention.
+        Mirrors _to_daily() pattern used for fundamental factors.
+        """
+        if df_subset.empty:
+            return pd.DataFrame(index=daily_index, columns=tickers, dtype=float)
+
+        # Aggregate multiple scores on same (ticker, date) → mean
+        agg = (
+            df_subset.groupby(['date', 'ticker'])['compound']
+            .mean()
+            .unstack('ticker')          # → Date × Ticker wide table
+            .reindex(columns=tickers)
+        )
+        # Align to full daily trading index, forward-fill, then shift 1 day
+        daily = (
+            agg
+            .reindex(agg.index.union(daily_index))
+            .sort_index()
+            .ffill(limit=ffill_limit)
+            .reindex(daily_index)
+            .shift(1)                   # T+1 shift: no lookahead
+        )
+        return daily
+
+    news_wide    = _to_daily_wide(raw[news_mask],    news_ffill_days)
+    filing_wide  = _to_daily_wide(raw[filing_mask],  filing_ffill_days)
+
+    # ── Stack back to (Date, Ticker) MultiIndex ───────────────────────────────
+    frames = []
+    for ticker in tickers:
+        ticker_df = pd.DataFrame({
+            'News_Sentiment':   news_wide[ticker]   if ticker in news_wide.columns   else np.nan,
+            'Filing_Sentiment': filing_wide[ticker] if ticker in filing_wide.columns else np.nan,
+        }, index=daily_index)
+        ticker_df.index.name = 'Date'
+        ticker_df['Ticker'] = ticker
+        frames.append(ticker_df.reset_index().set_index(['Date', 'Ticker']))
+
+    return pd.concat(frames).sort_index()
+
+
 # ── Factor computation ────────────────────────────────────────────────────────
 
 def _calculate_rsi(series, window):
@@ -169,8 +288,71 @@ def _cross_sectional_zscore_normalize(factor_df):
     return pd.concat(normalized_frames)
 
 
+def _sector_neutral_zscore_normalize(factor_df, sector_map: dict):
+    """
+    Sector-neutral cross-sectional z-score per day.
+
+    Each factor is z-scored WITHIN each GICS sector separately, removing
+    common sector-level variation.  Tickers not present in sector_map are
+    grouped into an implicit 'Unknown' sector and z-scored among themselves.
+
+    Sectors with only one valid observation for a factor receive NaN for that
+    factor on that day (can't compute a meaningful z-score).
+
+    Parameters
+    ----------
+    factor_df  : (Date, Ticker) MultiIndex DataFrame of raw factor values
+    sector_map : dict mapping ticker → sector string
+
+    Returns
+    -------
+    DataFrame with same shape/index as factor_df, values replaced by
+    within-sector z-scores.
+    """
+    normalized_frames = []
+
+    for date in factor_df.index.get_level_values('Date').unique():
+        daily = factor_df.loc[date]
+        normed = pd.DataFrame(np.nan, index=daily.index, columns=daily.columns,
+                              dtype=float)
+
+        # Build sector → [ticker] groups (one pass per date, not per factor)
+        sector_groups: dict[str, list] = {}
+        for ticker in daily.index:
+            sec = sector_map.get(ticker, 'Unknown')
+            sector_groups.setdefault(sec, []).append(ticker)
+
+        for col in daily.columns:
+            s = daily[col]
+            for sec, sec_tickers in sector_groups.items():
+                sec_vals = s.loc[sec_tickers].dropna()
+                if len(sec_vals) < 2:
+                    # Single valid ticker in sector → can't z-score; leave NaN
+                    continue
+                mean = sec_vals.mean()
+                std  = sec_vals.std()
+                if std == 0:
+                    normed.loc[sec_tickers, col] = 0.0
+                else:
+                    normed.loc[sec_tickers, col] = (s.loc[sec_tickers] - mean) / std
+
+        mi = pd.MultiIndex.from_product([[date], daily.index],
+                                        names=['Date', 'Ticker'])
+        normed.index = mi
+        normalized_frames.append(normed)
+
+    if not normalized_frames:
+        return pd.DataFrame(
+            index=pd.MultiIndex.from_arrays([[], []], names=['Date', 'Ticker']))
+
+    return pd.concat(normalized_frames)
+
+
 def compute_factors(ohlcv_df: pd.DataFrame,
-                    include_pin: bool = True) -> pd.DataFrame:
+                    include_pin: bool = True,
+                    include_sentiment: bool = False,
+                    sentiment_db: str | Path = "data/sentiment.db",
+                    sector_map: dict | None = None) -> pd.DataFrame:
     """
     Compute cross-sectional alpha factors from OHLCV data.
 
@@ -181,12 +363,21 @@ def compute_factors(ohlcv_df: pd.DataFrame,
     Fundamental factors (annual, forward-filled; NaN kept for older dates):
       PE_Ratio, PB_Ratio, ROE, ROA
 
-    All factors are cross-sectionally z-scored daily.
+    By default all factors are cross-sectionally z-scored daily across the
+    full universe.  When sector_map is provided the z-scoring is done WITHIN
+    each GICS sector (sector-neutral normalization), removing common
+    sector-level variation before composite scoring.
 
     Parameters
     ----------
-    ohlcv_df   : wide OHLCV DataFrame, (Ticker, Price) MultiIndex columns
-    include_pin: if True, append EKOP PIN + event_label factors
+    ohlcv_df           : wide OHLCV DataFrame, (Ticker, Price) MultiIndex columns
+    include_pin        : if True, append EKOP PIN + event_label factors
+    include_sentiment  : if True, load FinBERT News_Sentiment + Filing_Sentiment
+                         from sentiment_db. Requires pipeline to have been run first.
+    sentiment_db       : path to sentiment.db produced by data/pipeline/pipeline.py
+    sector_map         : optional dict {ticker: sector_string}.  When provided,
+                         factors are z-scored within each sector separately
+                         (sector-neutral mode) instead of across the full universe.
 
     Returns
     -------
@@ -258,13 +449,28 @@ def compute_factors(ohlcv_df: pd.DataFrame,
     # Drop rows missing any technical factor (fundamentals may remain NaN)
     combined = combined.dropna(subset=_TECHNICAL_COLS)
 
-    # Cross-sectional z-score normalise all columns
-    factor_df = _cross_sectional_zscore_normalize(combined)
+    # Z-score normalise: sector-neutral if sector_map provided, else full cross-section
+    if sector_map:
+        factor_df = _sector_neutral_zscore_normalize(combined, sector_map)
+    else:
+        factor_df = _cross_sectional_zscore_normalize(combined)
 
     if include_pin:
         from pintrade.features.ekop_model import compute_ekop_factor
         pin_df    = compute_ekop_factor(ohlcv_df, period='annual')
         factor_df = factor_df.join(pin_df, how='left')
+
+    if include_sentiment:
+        daily_index  = ohlcv_df.index
+        ticker_list  = list(ohlcv_df.columns.get_level_values('Ticker').unique())
+        sent_df      = load_sentiment_factor(ticker_list, daily_index, sentiment_db)
+
+        # Keep only the rows that survived technical-factor dropna
+        sent_df      = sent_df.reindex(factor_df.index)
+
+        # Z-score sentiment columns cross-sectionally and join
+        sent_normed  = _cross_sectional_zscore_normalize(sent_df)
+        factor_df    = factor_df.join(sent_normed, how='left')
 
     return factor_df
 

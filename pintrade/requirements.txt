@@ -6,3 +6,19 @@ matplotlib
 pytest
 python-dotenv
 scipy
+
+# ── Unstructured data pipeline ────────────────────────────────────────────────
+pdfplumber          # PDF text + table extraction (mirrors FINDMIND's pdfplumber usage)
+beautifulsoup4      # HTML parsing for SEC EDGAR .htm filings
+lxml                # fast HTML/XML parser backend for BeautifulSoup
+requests            # HTTP downloads (SEC EDGAR, RSS)
+feedparser          # RSS feed parsing for financial news
+chromadb            # local persistent vector database
+sentence-transformers  # local embeddings (all-MiniLM-L6-v2, no API key)
+loguru              # structured logging (mirrors FINDMIND's loguru usage)
+
+# ── Sentiment scoring ─────────────────────────────────────────────────────────
+# Install CUDA-enabled torch first (for 4090 Ti, CUDA 12.x):
+#   pip install torch --index-url https://download.pytorch.org/whl/cu121
+transformers        # FinBERT model (ProsusAI/finbert, ~420MB download on first use)
+accelerate          # required by transformers for GPU device_map
