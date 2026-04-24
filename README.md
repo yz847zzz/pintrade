@@ -1,8 +1,14 @@
 # PINtrade — Alpha Factor Research & Backtesting Framework
 
-PINtrade is a Python framework for quantitative equity research that combines **technical factors**, **fundamental factors**, **market-microstructure PIN**, and **FinBERT-scored SEC filings** into a composite alpha signal, then validates it through IC analysis and walk-forward backtesting.
+This project implements a systematic long/short equity strategy on the S&P 500 universe that integrates three distinct classes of alpha signal: conventional price-and-fundamental factors, market-microstructure signals derived from structural order-flow models, and NLP-based sentiment scores extracted from SEC annual filings.
 
-The full pipeline runs from raw OHLCV prices and SEC EDGAR filings through FinBERT sentiment scoring to a self-financing long/short equity curve — all with strict point-in-time discipline and no lookahead bias.
+**Market microstructure.** The Probability of Informed Trading (PIN) and daily event labels are estimated under two structural models of order arrival. The baseline is the Easley, Kiefer, O'Hara & Paperman (1996) EKOP model, which decomposes daily buyer- and seller-initiated volume into Poisson processes conditioned on the latent information state of the market. We additionally implement the Venter & de Jongh (2006) VdJ model, which replaces the Poisson arrival assumption with an Inverse Gaussian–Poisson mixture and introduces a dispersion parameter ψ to better capture the overdispersion in empirical order flow. Both models are fitted via maximum likelihood on a per-ticker, per-year basis; each trading day is then classified as a *Good News* (+1), *Bad News* (−1), or *No-Event* (0) day through Bayesian posterior inference on the fitted parameters. The resulting PIN scalar and event label are used directly as factor inputs to the composite signal.
+
+**Textual sentiment.** A separate NLP pipeline downloads 10-K, 8-K, and 10-Q filings from SEC EDGAR, extracts narrative sections (MD&A, Risk Factors, earnings releases), and scores each text chunk with `ProsusAI/finbert` — a BERT model fine-tuned on financial analyst reports (Huang et al., 2023). The filing-level compound sentiment score (P(positive) − P(negative)) is forward-filled with a 90-day window and shifted forward one trading day to eliminate lookahead bias, then treated as a medium-term fundamental tone signal following the framework of Loughran & McDonald (2011) and Tetlock (2007).
+
+**Conventional alpha factors.** These signals are complemented by a library of 13+ cross-sectionally z-scored factors spanning price momentum (Jegadeesh & Titman, 1993), Amihud (2002) illiquidity, return volatility, volume reversal, and annual-report fundamental ratios (P/B, P/E, ROE, ROA) with a 60-day reporting lag applied to enforce point-in-time discipline.
+
+All factor weights are selected in-sample by Spearman Rank IC significance (|t-stat| > 2.0) and validated out-of-sample through a five-fold annual walk-forward protocol. The portfolio is constructed as a dollar-neutral long/short book with regime-conditional short-leg sizing driven by a composite bear-market indicator (VIX, 200-day moving average, 12-month price momentum).
 
 ---
 
@@ -11,7 +17,7 @@ The full pipeline runs from raw OHLCV prices and SEC EDGAR filings through FinBE
 | Module | What it does |
 |--------|-------------|
 | **Factor Library** | 13+ alpha factors across technical, fundamental, microstructure, and NLP categories |
-| **EKOP / PIN Model** | Easley-Kiefer-O'Hara-Paperman (1996) MLE to estimate Probability of Informed Trading from daily order flow |
+| **EKOP / VdJ PIN Models** | Easley et al. (1996) Poisson model + Venter & de Jongh (2006) Inverse Gaussian–Poisson extension; both estimate PIN and daily event labels via MLE |
 | **SEC Filing Pipeline** | Downloads 10-K / 8-K / 10-Q from EDGAR, chunks narrative sections, scores with FinBERT |
 | **FinBERT Sentiment** | `ProsusAI/finbert` scores MD&A and earnings text → `Filing_Sentiment` and `News_Sentiment` factors |
 | **IC / MI Analysis** | Spearman Rank IC + Kraskov Mutual Information to detect both linear and nonlinear factor signals |
