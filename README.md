@@ -458,9 +458,34 @@ Install: `pip install -r requirements.txt`
 
 ---
 
+## Contributing & Roadmap
+
+Contributions are welcome — whether that is a new alpha factor, an improved microstructure model, or a better sentiment pipeline. Below are the open research directions; feel free to open an issue or PR for any of them.
+
+### Near-Term
+- [ ] **Complete SP100 sentiment coverage** — run `run_sec_sp100_remaining.py` for the remaining ~45 tickers (JPM, BAC, GS, KO, NKE, etc.); expect Sharpe improvement once filing sentiment has full cross-sectional breadth
+- [ ] **Regime-aware factor weights** — switch factor weights dynamically between regimes (bull: momentum/growth; bear: low-vol/value/defensive) rather than holding fixed weights across all market states
+- [ ] **VdJ on OHLCV universe** — the VdJ model currently requires raw TAQ trade counts; extend `features/vdj_taq.py` to fall back to BVC-estimated buy/sell volume so it can run on the full SP100 universe without TAQ data
+
+### Medium-Term
+- [ ] **Post-Earnings Announcement Drift (PEAD) strategy** — trade on 8-K release days and hold 3–10 days; independent of the monthly rebalance book and therefore low-correlation to the existing L/S strategy
+- [ ] **Nonlinear factor model** — ROA and P/E show high Mutual Information but near-zero Spearman IC, suggesting threshold-type return relationships; a gradient boosting model (XGBoost / LightGBM) over the full factor set would capture this
+- [ ] **Expand universe to Russell 500+** — test whether PIN and filing-sentiment signals survive in mid- and small-cap stocks where information asymmetry is higher and the EKOP model is theoretically more applicable
+
+### Long-Term
+- [ ] **Event-driven + monthly strategy combination** — the two books have near-zero return correlation; combining them should increase the aggregate Sharpe ratio materially
+- [ ] **Fine-tuned financial LLM for sentiment** — replace FinBERT with a domain-adapted model (e.g., FinLlama or fine-tuned Llama-3) trained on 10-K/8-K text to improve tone classification on technical financial language
+- [ ] **Live trading integration** — connect the signal pipeline to a broker API (Interactive Brokers / Alpaca) with daily factor refresh and automated rebalancing
+- [ ] **Multi-agent research architecture** — decompose the research loop into specialised agents (data agent, quant agent, NLP agent, risk agent) coordinated by a portfolio manager agent
+
+See [`docs/ROADMAP.md`](docs/ROADMAP.md) for more detail on completed research milestones.
+
+---
+
 ## References
 
-- Easley, Kiefer, O'Hara, Paperman (1996). *Liquidity, Information, and Infrequently Traded Stocks.* Journal of Finance.
+- Easley, Kiefer, O'Hara & Paperman (1996). *Liquidity, Information, and Infrequently Traded Stocks.* Journal of Finance.
+- Venter & de Jongh (2006). *Extending the EKOP model to allow for an Inverse Gaussian–Poisson mixture of order arrivals.* South African Statistical Journal.
 - Loughran & McDonald (2011). *When Is a Liability Not a Liability? Textual Analysis, Dictionaries, and 10-Ks.* Journal of Finance.
 - Tetlock (2007). *Giving Content to Investor Sentiment.* Journal of Finance.
 - Jegadeesh & Titman (1993). *Returns to Buying Winners and Selling Losers.* Journal of Finance.
