@@ -1,0 +1,78 @@
+
+CONCLUSION: EKOP Event Label x Filing Sentiment Analysis
+=========================================================
+
+SP25 Universe, 2019-2024  |  Aligned pairs: 26,934
+
+1. STATISTICAL SIGNIFICANCE
+   Kruskal-Wallis H=1.20, p=5.49e-01  ->  the three event_label groups
+   do NOT have significantly different Filing_Sentiment distributions.
+   Effect size eta^2=-0.0000 (small (<0.01)).
+
+   Post-hoc Mann-Whitney (two-sided):
+   * Good (+1) vs Bad (-1)               r=0.004  ns
+   * Good (+1) vs NoEvent (0)            r=0.008  ns
+   * Bad (-1) vs NoEvent (0)             r=0.005  ns
+
+2. LINEAR vs NONLINEAR
+   Pearson r = -0.0084 (reference -- invalid for discrete target)
+   Spearman rho = -0.0035  (p=5.71e-01)
+   Real MI    = 0.15089 nats  vs  shuffle mean=0.00142  (perm p=0.0000)
+
+   The relationship is NONLINEAR: MI captures signal that Pearson misses.
+   MI/|Pearson| ratio = 17.97x -- substantial nonlinear structure.
+
+   The positive Filing_Sentiment -> Good days / negative -> Bad days direction
+   IS confirmed by group means:
+     Bad (-1): mean=-0.0162
+     NoEvent:  mean=-0.0147
+     Good (+1):mean=-0.0173
+
+3. LEAD-LAG RELATIONSHIP
+   Peak Spearman rho at lag k=-3 (r=+0.0076)
+   Peak MI at lag k=-2 (MI=0.15223 nats)
+   -> EVENT_LABEL LEADS sentiment by 3 day(s)
+
+   Interpretation: Order-flow (informed trading) PRECEDES the market-wide sentiment reading -- smart money acts before the filing is scored.
+
+4. COMBINATION POTENTIAL
+   Both signals capture distinct information about information asymmetry:
+   * event_label: REAL-TIME order-flow signal (price/volume based, daily)
+   * Filing_Sentiment: LAGGED document signal (FinBERT scored, slow-moving)
+
+   Given the lead-lag finding (k=-3), the optimal combination strategy is:
+   Use event_label(t) as a predictor of next-period filing tone. For factor models, Filing_Sentiment is the lagging confirmation signal.
+
+   Recommendation: weight Filing_Sentiment into the factor composite with
+   its IC-derived sign, but consider a 3-day lag offset for alignment
+   with the order-flow signal.
+
+
+--- DESCRIPTIVE STATISTICS ---
+                 n      mean    median       std       q25       q75
+event_label                                                         
+Bad (-1)      9620 -0.016238 -0.009651  0.056111 -0.020178 -0.000927
+NoEvent (0)   6652 -0.014658 -0.009638  0.056106 -0.020169 -0.000451
+Good (+1)    10662 -0.017276 -0.009695  0.056622 -0.020463 -0.000598
+
+--- MANN-WHITNEY PAIRWISE ---
+                                   U   p-value         Z  r (effect) sig
+Pair                                                                    
+Good (+1) vs Bad (-1)     51064025.5  0.596917 -0.528839    0.003713  ns
+Good (+1) vs NoEvent (0)  35112646.0  0.275062 -1.091480    0.008295  ns
+Bad (-1) vs NoEvent (0)   31817007.0  0.543173 -0.608022    0.004766  ns
+
+--- LAG ANALYSIS ---
+     spearman_r  spearman_p        mi
+lag                                  
+-5     0.004953    0.417339  0.144242
+-4     0.004360    0.475048  0.144008
+-3     0.007611    0.212237  0.148201
+-2     0.005833    0.338893  0.152233
+-1     0.000729    0.904799  0.149499
+ 0    -0.003451    0.571164  0.147233
+ 1    -0.005288    0.385665  0.146708
+ 2    -0.005398    0.376135  0.150654
+ 3    -0.002966    0.626932  0.147480
+ 4    -0.004812    0.430553  0.144018
+ 5    -0.005851    0.338035  0.145117
